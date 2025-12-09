@@ -12,13 +12,19 @@ from tqdm import tqdm,trange
 import torch.nn.functional as F
 from gritlm import GritLM
 from openai import OpenAI
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel,AutoModelForCausalLM
 from InstructorEmbedding import INSTRUCTOR
+from numpy.random import randint
+from random import sample
+from peft import LoraConfig, get_peft_model
 
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 # from vertexai.language_models import TextEmbeddingInput, TextEmbeddingModel
 from torchmetrics.functional.pairwise import pairwise_cosine_similarity
+
+from tools import gcg_step,get_nonascii_toks,gcg_step_show,gcg_step_adq,gcg_step_avg,gcg_step_adq2,gcg_step_adq3,gcg_step_adq4,gcg_step_adq4_tk,gcg_step_adq3_tk
+from tools import gcg_step_avg_h,gcg_step_adq3_h,gcg_step_adq4_h
 
 def cut_text(text,tokenizer,threshold):
     text_ids = tokenizer(text)['input_ids']
@@ -126,6 +132,887 @@ def get_scores(query_ids,doc_ids,scores,excluded_ids):
             emb_scores[str(query_id)][pair[0]] = pair[1]
     return emb_scores
 
+def sample_query(doc,model,tokenizer):
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant. A knowledge document content is provided followed by the user. Please generate a query with a practical scenario that (1) seems not directly related to the document content (2) the document would be helpful to solve the query."},
+        {"role": "user", "content": doc}
+    ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        max_new_tokens=200  
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    #print(response)
+    return response
+
+def sample_query_div(doc,model,tokenizer):
+
+    div = randint(1,5)
+    if div ==1:
+        messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please generate a query with content in which the human asker is facing a practical problem and the document would be helpful to solve the it."},
+         {"role": "user", "content": doc}
+        ]
+    elif div==2:
+        messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please generate a query by questioning some factors of the document content."},
+         {"role": "user", "content": doc}
+        ]
+    elif div==3:
+        messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please generate a query targeting the document and containing five keywords from the document."},
+         {"role": "user", "content": doc}
+        ]
+    elif div==4:
+        messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please generate a one-sentence summary for this document."},
+         {"role": "user", "content": doc}
+        ]
+    elif div==5:
+        messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please generate a query that has similar semantics but contains few overlaps with the document."},
+         {"role": "user", "content": doc}
+        ]
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        max_new_tokens=200  
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    #print(response)
+    return response
+
+def sample_query_out(doc,model,tokenizer):
+
+    messages = [
+            {"role": "system", "content": "You are a helpful query writer for information retrieval system. A knowledge document content is provided followed by the user. Please first indentify its knowledge topic and then generate an unrelated query that totally belongs to another knowledge topic. You could choose any topic unrelated to the document."},
+         {"role": "user", "content": doc}
+        ]
+
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        max_new_tokens=200  
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+
+    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    #print(response)
+    return response
+
+
+def L_finetune(emb_in,emb_out):
+    #avg_in = torch.mean(torch.stack(emb_in), dim=0).detach()
+    loss = torch.zeros(1).to(emb_in[0].device)
+    #for emb in emb_in:
+    #    loss -= pairwise_cosine_similarity(emb,avg_in)[0]/len(emb_in)
+    for emb1 in emb_in:
+        for emb2 in emb_out:
+            loss += pairwise_cosine_similarity(emb1,emb2)[0]/(len(emb_in)*len(emb_out))
+    for emb1 in emb_in:
+        for emb2 in emb_in:
+            loss -= pairwise_cosine_similarity(emb1,emb2)[0]/(len(emb_in)*len(emb_in))
+    return loss
+
+def finetune_doc(model,tokenizer,doc_in,doc_out,num_epochs=3, batch_size=1, lr=5e-5):
+    max_length = 8192
+
+    lora_config = LoraConfig(
+        r=8,                   # rank of low-rank update
+        lora_alpha=16,          # scaling
+        target_modules=["q_proj", "v_proj"],  # only attention query/value matrices
+        lora_dropout=0.1,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    model.train()
+    model = get_peft_model(model, lora_config)
+    
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    word_embedding_layer = model.get_input_embeddings()
+    for _ in range(num_epochs):
+        doc_emb_in = []
+
+        for doc in doc_in:
+            doc_token_in = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+            doc_token_in = doc_token_in[0].reshape(1,-1)
+        
+            outputs = model(doc_token_in,output_hidden_states=True)  # shape: [batch_size, seq_length, hidden_dim]
+            last_hidden_state = outputs.hidden_states[-1]
+            doc_emb_in.append(last_hidden_state[:,-1])
+
+        doc_emb_out = []
+
+        for doc in doc_out:
+            doc_token_out = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+            doc_token_out = doc_token_out[0].reshape(1,-1)
+            outputs = model(doc_token_out,output_hidden_states=True)  # shape: [batch_size, seq_length, hidden_dim]
+
+            last_hidden_state = outputs.hidden_states[-1]
+            doc_emb_out.append(last_hidden_state[:,-1])
+        loss = L_finetune(doc_emb_in,doc_emb_out)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    
+    model = model.merge_and_unload()
+    for param in model.parameters():
+        param.requires_grad = True
+    #model.eval()
+    #print(f"Epoch {epoch+1}, Batch {i//batch_size+1}, Loss: {loss.item()}")
+    return model
+
+def attack_by_surrogate(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg_h(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+
+def attack_by_surrogate_div(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=20):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query_div(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg_h(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        torch.cuda.empty_cache()
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+    
+def attack_by_original(doc,query_o,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100,q_rate=0.3):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = query_o#sample_query(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+       
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+
+    
+def attack_by_advl(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100,q_rate=0.3):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        #query = sample_query(doc,model,tokenizer)
+        query = sample_query_div(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    q_list=[_ for _ in range(num_q)]
+    
+    for e in range(5):
+        #query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        query_ts,_ = gcg_step_adq3_h(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)  
+        adv_doc_t,min_loss = gcg_step_avg_h(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #q_index= sample(q_list,int(q_rate*num_q))
+        if e%25==13:
+            query_ts,_ = gcg_step_adq4_h(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+            #query_ts,_ = gcg_step_adq4(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq2(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #for q in q_index:
+        #    query_ts[q],_ = gcg_step_adq(adv_doc_t,query_ts[q], model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+
+    
+    
+def attack_by_advl_ft(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100,q_rate=0.3,N_FT=50):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    ft_querys_in = []
+    for i in range(N_FT):
+        #query = sample_query(doc,model,tokenizer)
+        ft_query = sample_query_div(doc,model,tokenizer)
+        ft_querys_in.append(ft_query)
+
+    ft_querys_out = []
+    for i in range(N_FT):
+        #query = sample_query(doc,model,tokenizer)
+        ft_query = sample_query_out(doc,model,tokenizer)
+        ft_querys_out.append(ft_query)
+    
+    model = finetune_doc(model,tokenizer,ft_querys_in,ft_querys_out,num_epochs=1, batch_size=1, lr=5e-4)    
+
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        #query = sample_query(doc,model,tokenizer)
+        query = sample_query_div(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    q_list=[_ for _ in range(num_q)]
+    
+    for e in range(5):
+        query_ts,_ = gcg_step_adq3_h(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        adv_doc_t,min_loss = gcg_step_avg_h(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #q_index= sample(q_list,int(q_rate*num_q))
+        if e%25==13:
+            query_ts,_ = gcg_step_adq4_h(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq2(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #for q in q_index:
+        #    query_ts[q],_ = gcg_step_adq(adv_doc_t,query_ts[q], model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+
+def attack_by_advl_tokens(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100,q_rate=0.3):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    adv_qidxs = []
+
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        st = query_token[0].shape[0]
+        sts_tokens = torch.full((1,num_sts_tokens), tokenizer.encode('*')[0])[0].to(model.device) 
+        ed = query_token[0].shape[0]+sts_tokens.shape[0]
+        query_ts.append(torch.cat([query_token[0],sts_tokens],dim=0))
+        adv_qidxs.append([_ for _ in range(st,ed)])
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    q_list=[_ for _ in range(num_q)]
+    
+
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)
+
+
+    #for e in range(10):
+    #    query_ts,_ = gcg_step_adq3_tk(adv_doc_t,query_ts,adv_qidxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts,adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+        q_index= sample(q_list,int(q_rate*num_q))
+        #query_ts,_ = gcg_step_adq4_tk(adv_doc_t,query_ts,adv_qidxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #query_ts,_ = gcg_step_adq2(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #for q in q_index:
+        #    query_ts[q],_ = gcg_step_adq(adv_doc_t,query_ts[q], model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    return adv_doc,adv_doc_t
+
+
+def attack_by_surrogate_emb(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    word_embedding_layer = model.get_input_embeddings()
+    query_embs = [word_embedding_layer(query_token.reshape(1,-1))[:,-1].detach() for query_token in query_ts]
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+       
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    adv_emb = word_embedding_layer(adv_doc_t.reshape(1,-1))[:,-1].detach()
+    return adv_doc,adv_doc_t,query_embs,adv_emb
+
+def attack_by_adiv_emb(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query_div(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    word_embedding_layer = model.get_input_embeddings()
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    adv_emb = word_embedding_layer(adv_doc_t.reshape(1,-1))[:,-1].detach()
+    query_embs = [word_embedding_layer(query_token.reshape(1,-1))[:,-1].detach() for query_token in query_ts]
+    return adv_doc,adv_doc_t,query_embs,adv_emb
+
+def attack_by_adv_emb(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query_div(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    word_embedding_layer = model.get_input_embeddings()
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    
+    for e in range(5):
+        query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        if e%25==13:
+            query_ts,_ = gcg_step_adq4(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    adv_emb = word_embedding_layer(adv_doc_t.reshape(1,-1))[:,-1].detach()
+    query_embs = [word_embedding_layer(query_token.reshape(1,-1))[:,-1].detach() for query_token in query_ts]
+    return adv_doc,adv_doc_t,query_embs,adv_emb
+
+def attack_by_adv2_emb(doc,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+    for i in range(num_q):
+        query = sample_query(doc,model,tokenizer)
+        #print(query)
+        query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+        query_ts.append(query_token[0])
+    
+    word_embedding_layer = model.get_input_embeddings()
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        #adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4)
+        adv_doc_t,min_loss = gcg_step_avg(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+       
+        query_ts,_ = gcg_step_adq3(adv_doc_t,query_ts, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    adv_emb = word_embedding_layer(adv_doc_t.reshape(1,-1))[:,-1].detach()
+    query_embs = [word_embedding_layer(query_token.reshape(1,-1))[:,-1].detach() for query_token in query_ts]
+    return adv_doc,adv_doc_t,query_embs,adv_emb
+
+def attack_by_original_emb(doc,query_o,model=None,tokenizer=None,num_sts_tokens=10,num_q=10, epochs=100,q_rate=0.3):
+    #attacking a surrogate model without interaction with origianl
+    if model==None:
+        model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    max_length = 8192#kwargs.get('doc_max_length',8192)
+    
+    query_ts = []
+    #print("start generating query")
+
+    query = query_o#sample_query(doc,model,tokenizer)
+    #print(query)
+    query_token = tokenizer([query], padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    query_ts.append(query_token[0])
+    
+    word_embedding_layer = model.get_input_embeddings()
+    query_emb = word_embedding_layer(query_token.reshape(1,-1))[:,-1].detach()
+
+    #print("query finish")
+    forbidden_tokens = get_nonascii_toks(tokenizer)
+    doc_token = tokenizer([doc], max_length=max_length, padding=True, truncation=True, return_tensors='pt')["input_ids"].to(model.device)
+    doc_token = doc_token[0].reshape(1,-1)
+    doc_emb = word_embedding_layer(doc_token)[:,-1].detach()
+    st = doc_token.shape[1]
+    sts_tokens = torch.full((1, num_sts_tokens), tokenizer.encode('*')[0]).to(model.device)  # Insert optimizable tokens
+    ed = doc_token.shape[1]+sts_tokens.shape[1]
+    adv_idxs = [_ for _ in range(st,ed)]
+    #print(adv_idxs)
+    adv_doc_t = torch.cat([doc_token,sts_tokens],dim=1)
+    for e in range(epochs):
+        model.eval()
+        #doc_emb = model.encode(doc, show_progress_bar=True, batch_size=batch_size, normalize_embeddings=True)
+        #if e%100==0:
+        #    adv_doc_t,min_loss = gcg_step_show(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=12, batch_size=4,tokenizer=tokenizer)
+        #else:    
+        adv_doc_t,min_loss = gcg_step(adv_doc_t,query_ts, adv_idxs, model, forbidden_tokens, top_k=10, num_samples=16, batch_size=4)
+       
+        #if e %100==0:
+        #print(adv_doc_t)
+            #adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+            #print(f"epoch {e}- loss:{min_loss} adv_doc:{adv_doc}")
+    adv_doc = tokenizer.batch_decode(adv_doc_t, skip_special_tokens=True)[0]
+    adv_emb = word_embedding_layer(adv_doc_t.reshape(1,-1))[:,-1].detach()
+    return adv_doc,adv_doc_t,query_emb,doc_emb,adv_emb
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def model_score(tokenizer,model,doc,query):
+    messages = [
+    {"role": "system", "content": "You are a helpful assistant. I'm giving you a document and a query, please answer 'yes' or 'no' to indicate if they are related."},
+    {"role": "user", "content": f"Query: {query}"},
+    {"role": "user", "content": f"Document: {doc}"}
+    ]
+    text = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+    )
+    model_inputs = tokenizer([text], return_tensors="pt").to(device)
+    yes_id =  tokenizer(["yes"], return_tensors="pt").input_ids
+
+    yes_id =  yes_id[0]
+    no_id =  tokenizer(["no"], return_tensors="pt").input_ids
+    no_id = no_id[0]
+    #print(yes_id)
+    #print(no_id)
+    #print(model_inputs)
+
+    with torch.no_grad():
+        outputs = model(**model_inputs)
+
+    # Get logits for next token (the last position)
+    #print("shapes:")
+    #print(outputs.logits.shape)
+    next_token_logits = outputs.logits[:, -1, :]  # shape [1, vocab_size]
+
+    # Convert logits to probabilities
+    probs = F.softmax(next_token_logits, dim=-1)
+    #print(probs.shape)
+    #print(probs[0,yes_id])
+    #print(probs[0,no_id])
+    return probs[0,yes_id]/(probs[0,yes_id]+probs[0,no_id])
+
+@torch.no_grad()
+def get_scores_sf_qwen_e5(queries,query_ids,documents,doc_ids,task,model_id,instructions,cache_dir,excluded_ids,long_context,**kwargs):
+    if model_id=='sf':
+        tokenizer = AutoTokenizer.from_pretrained('salesforce/sfr-embedding-mistral')
+        model = AutoModel.from_pretrained('salesforce/sfr-embedding-mistral',device_map="auto").eval()
+        max_length = kwargs.get('doc_max_length',4096)
+    elif model_id=='qwen':
+        tokenizer = AutoTokenizer.from_pretrained('alibaba-nlp/gte-qwen1.5-7b-instruct', trust_remote_code=True)
+        model = AutoModel.from_pretrained('alibaba-nlp/gte-qwen1.5-7b-instruct', device_map="auto", trust_remote_code=True).eval()
+        max_length = kwargs.get('doc_max_length',8192)
+    elif model_id=='qwen2':
+        tokenizer = AutoTokenizer.from_pretrained('alibaba-nlp/gte-qwen2-7b-instruct', trust_remote_code=True)
+        model = AutoModel.from_pretrained('alibaba-nlp/gte-qwen2-7b-instruct', device_map="auto", trust_remote_code=True).eval()
+        max_length = kwargs.get('doc_max_length',8192)
+    elif model_id=='e5':
+        tokenizer = AutoTokenizer.from_pretrained('intfloat/e5-mistral-7b-instruct')
+        model = AutoModel.from_pretrained('intfloat/e5-mistral-7b-instruct', device_map="auto").eval()
+        max_length = kwargs.get('doc_max_length',4096)
+    else:
+        raise ValueError(f"The model {model_id} is not supported")
+    model = model.eval()
+    queries = add_instruct_concatenate(texts=queries,task=task,instruction=instructions['query'])
+    batch_size = kwargs.get('encode_batch_size',1)
+
+    doc_emb = None
+    cache_path = os.path.join(cache_dir, 'doc_emb', model_id, task, f"long_{long_context}_{batch_size}.npy")
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    #if os.path.isfile(cache_path):
+        # already exists so we can just load it
+    #    doc_emb = np.load(cache_path, allow_pickle=True)
+    
+
+    # need a function of :
+    # docs = optimized(model, documents, g_id)
+
+
+    for start_idx in trange(0,len(documents),batch_size):
+        assert doc_emb is None or doc_emb.shape[0] % batch_size == 0, f"{doc_emb % batch_size} reminder in doc_emb"
+        if doc_emb is not None and doc_emb.shape[0] // batch_size > start_idx:
+            continue
+        #print(documents[start_idx:start_idx+batch_size])
+        batch_dict = tokenizer(documents[start_idx:start_idx+batch_size], max_length=max_length, padding=True, truncation=True, return_tensors='pt').to(model.device)
+        outputs = model(**batch_dict)
+        embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu()
+        # doc_emb[start_idx] = embeddings
+        doc_emb = embeddings if doc_emb is None else np.concatenate((doc_emb, np.array(embeddings)), axis=0)
+
+        # save the embeddings every 1000 iters, you can adjust this as needed
+        if (start_idx + 1) % 1000 == 0:
+            np.save(cache_path, doc_emb)
+        
+    np.save(cache_path, doc_emb)
+
+    doc_emb = torch.tensor(doc_emb)
+    #print("doc_emb shape:",doc_emb.shape)
+    doc_emb = F.normalize(doc_emb, p=2, dim=1)
+    query_emb = []
+    for start_idx in trange(0, len(queries), batch_size):
+        batch_dict = tokenizer(queries[start_idx:start_idx + batch_size], max_length=max_length, padding=True,
+                               truncation=True, return_tensors='pt').to(model.device)
+        outputs = model(**batch_dict)
+        embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu().tolist()
+        query_emb += embeddings
+    query_emb = torch.tensor(query_emb)
+    #print("query_emb shape:", query_emb.shape)
+    query_emb = F.normalize(query_emb, p=2, dim=1)
+    scores = (query_emb @ doc_emb.T) * 100
+    scores = scores.tolist()
+    return query_emb,doc_emb,scores
 
 @torch.no_grad()
 def retrieval_sf_qwen_e5(queries,query_ids,documents,doc_ids,task,model_id,instructions,cache_dir,excluded_ids,long_context,**kwargs):
@@ -154,15 +1041,20 @@ def retrieval_sf_qwen_e5(queries,query_ids,documents,doc_ids,task,model_id,instr
     doc_emb = None
     cache_path = os.path.join(cache_dir, 'doc_emb', model_id, task, f"long_{long_context}_{batch_size}.npy")
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    if os.path.isfile(cache_path):
+    #if os.path.isfile(cache_path):
         # already exists so we can just load it
-        doc_emb = np.load(cache_path, allow_pickle=True)
+    #    doc_emb = np.load(cache_path, allow_pickle=True)
     
+
+    # need a function of :
+    # docs = optimized(model, documents, g_id)
+
+
     for start_idx in trange(0,len(documents),batch_size):
         assert doc_emb is None or doc_emb.shape[0] % batch_size == 0, f"{doc_emb % batch_size} reminder in doc_emb"
         if doc_emb is not None and doc_emb.shape[0] // batch_size > start_idx:
             continue
-
+        #print(documents[start_idx:start_idx+batch_size])
         batch_dict = tokenizer(documents[start_idx:start_idx+batch_size], max_length=max_length, padding=True, truncation=True, return_tensors='pt').to(model.device)
         outputs = model(**batch_dict)
         embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu()
@@ -176,7 +1068,7 @@ def retrieval_sf_qwen_e5(queries,query_ids,documents,doc_ids,task,model_id,instr
     np.save(cache_path, doc_emb)
 
     doc_emb = torch.tensor(doc_emb)
-    print("doc_emb shape:",doc_emb.shape)
+    #print("doc_emb shape:",doc_emb.shape)
     doc_emb = F.normalize(doc_emb, p=2, dim=1)
     query_emb = []
     for start_idx in trange(0, len(queries), batch_size):
@@ -186,7 +1078,7 @@ def retrieval_sf_qwen_e5(queries,query_ids,documents,doc_ids,task,model_id,instr
         embeddings = last_token_pool(outputs.last_hidden_state, batch_dict['attention_mask']).cpu().tolist()
         query_emb += embeddings
     query_emb = torch.tensor(query_emb)
-    print("query_emb shape:", query_emb.shape)
+    #print("query_emb shape:", query_emb.shape)
     query_emb = F.normalize(query_emb, p=2, dim=1)
     scores = (query_emb @ doc_emb.T) * 100
     scores = scores.tolist()

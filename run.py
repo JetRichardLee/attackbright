@@ -1,9 +1,14 @@
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,7"
+import torch
 import argparse
 import json
 from tqdm import tqdm
-from retrievers import RETRIEVAL_FUNCS,calculate_retrieval_metrics
+from retrievers import RETRIEVAL_FUNCS,calculate_retrieval_metrics,attack_by_surrogate,attack_by_advl,attack_by_original,attack_by_advl_tokens,attack_by_surrogate_div,attack_by_advl_ft
 from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModel,AutoModelForCausalLM
+#export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
@@ -14,6 +19,7 @@ if __name__=='__main__':
     parser.add_argument('--model', type=str, required=True,
                         choices=['bm25','cohere','e5','google','grit','inst-l','inst-xl',
                                  'openai','qwen','qwen2','sbert','sf','voyage','bge'])
+                                 
     parser.add_argument('--long_context', action='store_true')
     parser.add_argument('--query_max_length', type=int, default=-1)
     parser.add_argument('--doc_max_length', type=int, default=-1)
@@ -46,11 +52,21 @@ if __name__=='__main__':
         doc_pairs = load_dataset('xlangai/bright', 'documents',cache_dir=args.cache_dir)[args.task]
     doc_ids = []
     documents = []
+    mapping_doc = {}
     for dp in doc_pairs:
+        #print(dp['id'])
         doc_ids.append(dp['id'])
         documents.append(dp['content'])
+        mapping_doc[dp['id']]=len(doc_ids)-1
 
-    if not os.path.isfile(score_file_path):
+    
+    surrogate_model = AutoModelForCausalLM.from_pretrained(
+            "Qwen/Qwen1.5-4B-Chat",
+            torch_dtype="auto",
+            device_map="auto"
+        )
+    surrogate_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen1.5-4B-Chat")
+    if True:#not os.path.isfile(score_file_path):
         with open(os.path.join(args.config_dir,args.model,f"{args.task}.json")) as f:
             config = json.load(f)
         if not os.path.isdir(args.output_dir):
@@ -59,13 +75,55 @@ if __name__=='__main__':
         queries = []
         query_ids = []
         excluded_ids = {}
-        for e in examples:
+        if args.long_context:
+            key = 'gold_ids_long'
+        else:
+            key = 'gold_ids'
+        #print(examples)
+        #print("Begin to attack")
+        #cnt =0 
+        for e in tqdm(examples):
             queries.append(e["query"])
             query_ids.append(e['id'])
             excluded_ids[e['id']] = e['excluded_ids']
             overlap = set(e['excluded_ids']).intersection(set(e['gold_ids']))
+            #"""
+            cnt=0
+            #print("Original:",e["query"])
+            for doc_id in e[key]:
+                index = mapping_doc[doc_id]
+                #if cnt==2:
+                    #with open('doc.txt', 'w') as file:
+                        # Write a string to the file
+                    #    file.write(documents[index])
+                #documents[index],_ = attack_by_surrogate(documents[index],surrogate_model,surrogate_tokenizer,num_q=20)
+                #documents[index],_ = attack_by_original(documents[index],e["query"],surrogate_model,surrogate_tokenizer,num_q=1)
+                #documents[index],_ = attack_by_advl(documents[index],surrogate_model,surrogate_tokenizer,num_q=10,q_rate=0.3)
+                documents[index],_ = attack_by_advl_ft(documents[index],surrogate_model,surrogate_tokenizer,num_q=10,N_FT=30)
+                #documents[index],_ = attack_by_surrogate_div(documents[index],surrogate_model,surrogate_tokenizer,num_q=10)
+                #documents[index],_ = attack_by_advl_tokens(documents[index],surrogate_model,surrogate_tokenizer,num_q=20,q_rate=0.3)
+                cnt+=1
+                #print(documents[index])
+                #break
+                torch.cuda.empty_cache()
+                if cnt>=3:
+                    break
+            #break
+            #"""
+            #print("//////////////////////////")
+            #print("id ",len(queries),":")
+            #print(e["query"])
+            #print(e[key])
+            
+            #print(mapping_doc[e[key][0]])
+            #print(documents[mapping_doc[e[key][0]]])
+            #if cnt%10==0:
+            #    print(cnt)
+            #    break
             assert len(overlap)==0
         assert len(queries)==len(query_ids), f"{len(queries)}, {len(query_ids)}"
+        #print(None.shape)
+        #print("attack_ended")
         if not os.path.isdir(os.path.join(args.cache_dir, 'doc_ids')):
             os.makedirs(os.path.join(args.cache_dir, 'doc_ids'))
         if os.path.isfile(os.path.join(args.cache_dir,'doc_ids',f"{args.task}_{args.long_context}.json")):
@@ -80,6 +138,10 @@ if __name__=='__main__':
 
         print(f"{len(queries)} queries")
         print(f"{len(documents)} documents")
+        
+        #documents = documents[:5]
+        #doc_ids = doc_ids[:5]
+
         if args.debug:
             documents = documents[:30]
             doc_paths = doc_ids[:30]
@@ -94,12 +156,22 @@ if __name__=='__main__':
             kwargs.update({'key': args.key})
         if args.ignore_cache:
             kwargs.update({'ignore_cache': args.ignore_cache})
+
+        """
+        Here to perform document perturbation
+        implement a function that 
+        docs = perform_attack(doc, gids)
+
+        doc-> pdoc
+        """
         scores = RETRIEVAL_FUNCS[args.model](
             queries=queries, query_ids=query_ids, documents=documents, excluded_ids=excluded_ids,
             instructions=config['instructions_long'] if args.long_context else config['instructions'],
             doc_ids=doc_ids, task=args.task, cache_dir=args.cache_dir, long_context=args.long_context,
             model_id=args.model, checkpoint= args.checkpoint, **kwargs
         )
+
+        #print(scores)
         with open(score_file_path,'w') as f:
             json.dump(scores,f,indent=2)
     else:
